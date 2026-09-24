@@ -32,12 +32,12 @@ static RUN_ID: LazyLock<String> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, Copy)]
-pub struct Names {
-    pub prefix: &'static str,
-    pub bookkeeping_schema: &'static str,
+pub struct Names<'a> {
+    pub prefix: &'a str,
+    pub bookkeeping_schema: &'a str,
 }
 
-impl Names {
+impl Names<'_> {
     pub fn validate(self, max_identifier_bytes: usize) -> Result<Self, Error> {
         for (what, name) in
             [("prefix", self.prefix), ("bookkeeping schema", self.bookkeeping_schema)]
@@ -155,7 +155,7 @@ mod tests {
     use super::*;
 
     const POSTGRES_MAX_IDENTIFIER_BYTES: usize = 63;
-    const NAMES: Names = Names { prefix: "tdb", bookkeeping_schema: "sqlx_testdb" };
+    const NAMES: Names<'static> = Names { prefix: "tdb", bookkeeping_schema: "sqlx_testdb" };
 
     fn test_hash(test_path: &str) -> String {
         hex_prefix(&Sha256::digest(test_path.as_bytes()), TEST_HASH_CHARS)

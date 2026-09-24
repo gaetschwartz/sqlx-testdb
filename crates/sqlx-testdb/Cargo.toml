@@ -14,17 +14,20 @@ workspace = true
 camino.workspace = true
 futures-util.workspace = true
 rand.workspace = true
+serde.workspace = true
 sha2.workspace = true
 snafu.workspace = true
 sqlx.workspace = true
 sqlx-testdb-macros = { version = "0.1.0", path = "../sqlx-testdb-macros" }
 tokio.workspace = true
+toml.workspace = true
 
 [features]
 default = ["postgres"]
 postgres = ["sqlx/postgres"]
 
 [dev-dependencies]
+camino.workspace = true
 rand.workspace = true
 sqlx = { workspace = true, features = ["postgres", "macros"] }
 tokio = { workspace = true, features = ["time"] }

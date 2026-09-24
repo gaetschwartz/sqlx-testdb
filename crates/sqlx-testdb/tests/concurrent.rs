@@ -4,10 +4,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use sqlx::PgPool;
-use sqlx_testdb::run;
+use sqlx_testdb::run_with;
 
 use common::{
-    BOOKKEEPING, admin, block_on, config, current_database, drop_all, exists, leak_config, token,
+    BOOKKEEPING, Scratch, admin, block_on, config, current_database, drop_all, exists, token,
     with_prefix,
 };
 
@@ -27,8 +27,9 @@ fn one_process_of_the_concurrent_pair() {
     else {
         return;
     };
-    let config = leak_config(config(&prefix, BOOKKEEPING, "concurrent", &schema));
-    run(config, "concurrent::same_test", &[], move |pool: PgPool| async move {
+    let scratch = Scratch::new();
+    let config = config(&scratch, &prefix, BOOKKEEPING, "concurrent", &schema);
+    run_with(&config, "concurrent::same_test", &[], move |pool: PgPool| async move {
         let name = current_database(&pool).await;
         let count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM shared").fetch_one(&pool).await.unwrap();

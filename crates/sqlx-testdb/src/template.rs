@@ -29,7 +29,7 @@ pub async fn drop<DB: Backend>(
 
 pub async fn ensure<DB: Backend>(
     conn: &mut DB::Connection,
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     schema: &LoadedSchema,
     options: &ConnectOptionsOf<DB>,
 ) -> Result<(), Error> {
@@ -41,7 +41,7 @@ pub async fn ensure<DB: Backend>(
 
 pub async fn clone_into<DB: Backend>(
     conn: &mut DB::Connection,
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     schema: &LoadedSchema,
     options: &ConnectOptionsOf<DB>,
     name: &str,
@@ -59,7 +59,7 @@ pub async fn clone_into<DB: Backend>(
 
 pub async fn drop_orphaned_builds<DB: Backend>(
     conn: &mut DB::Connection,
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
 ) -> Result<(), Error> {
     let orphans = DB::databases_with_prefix(conn, &ctx.names.building_prefix())
         .await
@@ -70,7 +70,7 @@ pub async fn drop_orphaned_builds<DB: Backend>(
     Ok(())
 }
 
-async fn touch<DB: Backend>(conn: &mut DB::Connection, ctx: &Ctx) -> Result<(), Error> {
+async fn touch<DB: Backend>(conn: &mut DB::Connection, ctx: &Ctx<'_>) -> Result<(), Error> {
     DB::touch_template(conn, ctx.names.bookkeeping_schema, &ctx.template)
         .await
         .context(BookkeepingSnafu)
@@ -78,7 +78,7 @@ async fn touch<DB: Backend>(conn: &mut DB::Connection, ctx: &Ctx) -> Result<(), 
 
 async fn build<DB: Backend>(
     conn: &mut DB::Connection,
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     schema: &LoadedSchema,
     options: &ConnectOptionsOf<DB>,
 ) -> Result<(), Error> {
@@ -91,7 +91,7 @@ async fn build<DB: Backend>(
 
 async fn build_locked<DB: Backend>(
     conn: &mut DB::Connection,
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     schema: &LoadedSchema,
     options: &ConnectOptionsOf<DB>,
 ) -> Result<(), Error> {

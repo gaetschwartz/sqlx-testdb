@@ -3,11 +3,11 @@ mod common;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use sqlx::{PgConnection, PgPool};
-use sqlx_testdb::{Config, run};
+use sqlx_testdb::{Config, run_with};
 
 use common::{
-    BOOKKEEPING, admin, block_on, config, current_database, drop_all, execute, exists, is_template,
-    leak_config, names, record, seen, token, with_prefix,
+    BOOKKEEPING, Scratch, admin, block_on, config, current_database, drop_all, execute, exists,
+    is_template, names, record, seen, token, with_prefix,
 };
 
 const SCHEMA: &str = "CREATE TABLE things (id INT PRIMARY KEY);";
@@ -16,10 +16,10 @@ fn fail() {
     panic!("the test failed");
 }
 
-fn passing(config: &'static Config, test_path: &'static str) -> String {
+fn passing(config: &Config, test_path: &str) -> String {
     let seen = seen();
     let recorder = seen.clone();
-    run(config, test_path, &[], move |pool: PgPool| async move {
+    run_with(config, test_path, &[], move |pool: PgPool| async move {
         record(&recorder, current_database(&pool).await);
     });
     names(&seen).remove(0)
@@ -47,10 +47,11 @@ async fn is_recorded(conn: &mut PgConnection, bookkeeping: &str, table: &str, na
 
 #[test]
 fn the_template_is_built_once_and_reused_and_passing_databases_are_dropped() {
+    let scratch = Scratch::new();
     let prefix = format!("it{}", token());
-    let config = leak_config(config(&prefix, BOOKKEEPING, &token(), SCHEMA));
-    let first = passing(config, "lifecycle::first");
-    let second = passing(config, "lifecycle::second");
+    let config = config(&scratch, &prefix, BOOKKEEPING, &token(), SCHEMA);
+    let first = passing(&config, "lifecycle::first");
+    let second = passing(&config, "lifecycle::second");
     assert_ne!(first, second);
     block_on(async {
         let mut conn = admin().await;
@@ -67,14 +68,15 @@ fn the_template_is_built_once_and_reused_and_passing_databases_are_dropped() {
 
 #[test]
 fn a_schema_change_builds_a_new_template() {
+    let scratch = Scratch::new();
     let prefix = format!("it{}", token());
     let root = token();
-    let before = leak_config(config(&prefix, BOOKKEEPING, &root, SCHEMA));
-    let after = leak_config(config(&prefix, BOOKKEEPING, &root, "CREATE TABLE others ();"));
-    passing(before, "lifecycle::before");
+    let before = config(&scratch, &prefix, BOOKKEEPING, &root, SCHEMA);
+    let after = config(&scratch, &prefix, BOOKKEEPING, &root, "CREATE TABLE others ();");
+    passing(&before, "lifecycle::before");
     let seen = seen();
     let recorder = seen.clone();
-    run(after, "lifecycle::after", &[], move |pool: PgPool| async move {
+    run_with(&after, "lifecycle::after", &[], move |pool: PgPool| async move {
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT table_name::text FROM information_schema.tables WHERE table_schema = 'public'",
         )
@@ -94,12 +96,13 @@ fn a_schema_change_builds_a_new_template() {
 
 #[test]
 fn a_failing_test_keeps_its_database_and_marks_it_failed() {
+    let scratch = Scratch::new();
     let prefix = format!("it{}", token());
-    let config = leak_config(config(&prefix, BOOKKEEPING, &token(), SCHEMA));
+    let config = config(&scratch, &prefix, BOOKKEEPING, &token(), SCHEMA);
     let panicked = seen();
     let recorder = panicked.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run(config, "lifecycle::panics", &[], move |pool: PgPool| async move {
+        run_with(&config, "lifecycle::panics", &[], move |pool: PgPool| async move {
             record(&recorder, current_database(&pool).await);
             fail();
         });
@@ -108,7 +111,7 @@ fn a_failing_test_keeps_its_database_and_marks_it_failed() {
     let errored = seen();
     let recorder = errored.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run(config, "lifecycle::errs", &[], move |pool: PgPool| async move {
+        run_with(&config, "lifecycle::errs", &[], move |pool: PgPool| async move {
             record(&recorder, current_database(&pool).await);
             Err::<(), _>("the test returned an error")
         });
@@ -131,15 +134,14 @@ fn a_failing_test_keeps_its_database_and_marks_it_failed() {
 
 #[test]
 fn keep_failed_off_drops_a_failing_database() {
+    let scratch = Scratch::new();
     let prefix = format!("it{}", token());
-    let config = leak_config(Config {
-        keep_failed: false,
-        ..config(&prefix, BOOKKEEPING, &token(), SCHEMA)
-    });
+    let config =
+        Config { keep_failed: false, ..config(&scratch, &prefix, BOOKKEEPING, &token(), SCHEMA) };
     let seen = seen();
     let recorder = seen.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run(config, "lifecycle::dropped", &[], move |pool: PgPool| async move {
+        run_with(&config, "lifecycle::dropped", &[], move |pool: PgPool| async move {
             record(&recorder, current_database(&pool).await);
             fail();
         });
@@ -156,25 +158,27 @@ fn keep_failed_off_drops_a_failing_database() {
 
 #[test]
 fn a_missing_database_url_names_the_variable() {
-    let config = leak_config(Config {
-        database_url_var: "SQLX_TESTDB_UNSET_URL",
-        ..config("itunset", BOOKKEEPING, "unset", SCHEMA)
-    });
-    let outcome = catch_unwind(|| run(config, "lifecycle::unset", &[], |_: PgPool| async {}));
+    let scratch = Scratch::new();
+    let config = Config {
+        database_url_var: "SQLX_TESTDB_UNSET_URL".to_owned(),
+        ..config(&scratch, "itunset", BOOKKEEPING, "unset", SCHEMA)
+    };
+    let outcome = catch_unwind(|| run_with(&config, "lifecycle::unset", &[], |_: PgPool| async {}));
     let message = outcome.unwrap_err().downcast::<String>().unwrap();
     assert_eq!(
         message.trim_end(),
-        "lifecycle::unset: SQLX_TESTDB_UNSET_URL is not set; point it at the database server the \
-         tests may use"
+        "lifecycle::unset: no database server: SQLX_TESTDB_UNSET_URL is not set and no \
+         sqlx-testdb.toml was found; set one of them to the server the tests may use"
     );
 }
 
 #[test]
 fn the_first_test_of_a_run_sweeps_leftovers_without_forcing() {
+    let scratch = Scratch::new();
     let prefix = format!("it{}", token());
     let bookkeeping = format!("sqlx_testdb_sweep_{}", token());
-    let base = config(&prefix, &bookkeeping, "sweep-setup", SCHEMA);
-    let current = passing(leak_config(base), "lifecycle::setup");
+    let base = config(&scratch, &prefix, &bookkeeping, "sweep-setup", SCHEMA);
+    let current = passing(&base, "lifecycle::setup");
     let (stale, busy, live, old_failed, new_failed) = (
         format!("{prefix}_stale"),
         format!("{prefix}_busy"),
@@ -209,7 +213,7 @@ fn the_first_test_of_a_run_sweeps_leftovers_without_forcing() {
         .await;
     });
     let busy_conn = hold_connection(&busy);
-    passing(leak_config(Config { project_root: "sweep-1", ..base }), "lifecycle::sweep");
+    passing(&Config { project_root: "sweep-1".into(), ..base.clone() }, "lifecycle::sweep");
     block_on(async {
         let mut conn = admin().await;
         assert!(!exists(&mut conn, &stale).await);
@@ -226,7 +230,7 @@ fn the_first_test_of_a_run_sweeps_leftovers_without_forcing() {
         assert!(exists(&mut conn, &template).await);
     });
     busy_conn.send(()).unwrap();
-    passing(leak_config(Config { project_root: "sweep-2", ..base }), "lifecycle::sweep_again");
+    passing(&Config { project_root: "sweep-2".into(), ..base }, "lifecycle::sweep_again");
     block_on(async {
         let mut conn = admin().await;
         assert!(!exists(&mut conn, &busy).await);

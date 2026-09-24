@@ -10,12 +10,14 @@ use common::current_database;
 
 static MIGRATOR: Migrator = sqlx::migrate!("tests/migrations");
 
-const CUSTOM: Config = Config {
-    prefix: "sqlxt_custom",
-    bookkeeping_schema: common::BOOKKEEPING,
-    schema: Schema::Migrator(&MIGRATOR),
-    ..Config::DEFAULT
-};
+fn custom() -> Config {
+    Config {
+        prefix: "sqlxt_custom".to_owned(),
+        bookkeeping_schema: common::BOOKKEEPING.to_owned(),
+        schema: Schema::Migrator(&MIGRATOR),
+        ..Config::default()
+    }
+}
 
 async fn tables(conn: &mut PgConnection) -> Vec<String> {
     sqlx::query_scalar(
@@ -103,7 +105,7 @@ async fn no_schema_leaves_the_database_empty(mut conn: PgConnection) {
     assert!(tables(&mut conn).await.is_empty());
 }
 
-#[sqlx_testdb::test(config = "CUSTOM")]
+#[sqlx_testdb::test(config = "custom")]
 async fn a_config_item_replaces_the_config_file(pool: PgPool) {
     assert!(current_database(&pool).await.starts_with("sqlxt_custom_"));
     let mut conn = pool.acquire().await.unwrap();

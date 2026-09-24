@@ -3,13 +3,13 @@ use snafu::ResultExt;
 use sqlx::migrate::{MigrationType, Migrator};
 
 use crate::backend::Backend;
-use crate::config::{Schema, SqlSource};
-use crate::error::{ApplySchemaSnafu, Error, LoadMigrationsSnafu, MigrateSnafu};
+use crate::config::Schema;
+use crate::error::{ApplySchemaSnafu, Error, LoadMigrationsSnafu, MigrateSnafu, ReadSchemaSnafu};
 
 #[derive(Debug)]
 pub enum LoadedSchema {
     None,
-    Sql(&'static [SqlSource]),
+    Sql(Vec<String>),
     Migrator(&'static Migrator),
     Loaded(Migrator),
 }
@@ -32,15 +32,19 @@ impl SourceKind {
 }
 
 impl LoadedSchema {
-    pub async fn load(schema: Schema) -> Result<Self, Error> {
+    pub async fn load(schema: &Schema) -> Result<Self, Error> {
         Ok(match schema {
             Schema::None => Self::None,
-            Schema::Sql(files) => Self::Sql(files),
+            Schema::Sql(files) => {
+                let mut texts = Vec::with_capacity(files.len());
+                for path in files {
+                    texts.push(std::fs::read_to_string(path).context(ReadSchemaSnafu { path })?);
+                }
+                Self::Sql(texts)
+            }
             Schema::Migrator(migrator) => Self::Migrator(migrator),
             Schema::Migrations(path) => Self::Loaded(
-                Migrator::new(camino::Utf8Path::new(path).as_std_path())
-                    .await
-                    .context(LoadMigrationsSnafu { path })?,
+                Migrator::new(path.as_std_path()).await.context(LoadMigrationsSnafu { path })?,
             ),
         })
     }
@@ -61,10 +65,10 @@ impl LoadedSchema {
             Self::Migrator(_) | Self::Loaded(_) => SourceKind::Migrations,
         };
         hasher.update(kind.tag());
-        if let Self::Sql(files) = self {
-            for file in *files {
-                hasher.update(file.sql.len().to_be_bytes());
-                hasher.update(file.sql.as_bytes());
+        if let Self::Sql(texts) = self {
+            for sql in texts {
+                hasher.update(sql.len().to_be_bytes());
+                hasher.update(sql.as_bytes());
             }
         }
         if let Some(migrator) = self.migrator() {
@@ -85,9 +89,9 @@ impl LoadedSchema {
     ) -> Result<(), Error> {
         match self {
             Self::None => Ok(()),
-            Self::Sql(files) => {
-                for file in *files {
-                    DB::apply_sql(conn, file.sql).await.context(ApplySchemaSnafu { name })?;
+            Self::Sql(texts) => {
+                for sql in texts {
+                    DB::apply_sql(conn, sql).await.context(ApplySchemaSnafu { name })?;
                 }
                 Ok(())
             }

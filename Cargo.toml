@@ -21,7 +21,7 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 
 [workspace.dependencies]
-camino = "1.2.6"
+camino = { version = "1.2.6", features = ["serde1"] }
 futures-util = "0.3.34"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"

@@ -79,6 +79,9 @@ name = "camino"
 version = "1.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "cfg-if"
@@ -1326,11 +1329,13 @@ dependencies = [
  "camino",
  "futures-util",
  "rand 0.10.3",
+ "serde",
  "sha2 0.11.0",
  "snafu",
  "sqlx",
  "sqlx-testdb-macros",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1339,9 +1344,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "serde",
  "syn 2.0.119",
- "toml",
 ]
 
 [[package]]

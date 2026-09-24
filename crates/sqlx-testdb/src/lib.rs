@@ -14,12 +14,7 @@ mod template;
 
 pub use args::{TestArgs, TestOutcome};
 pub use backend::{Backend, ConnectOptionsOf, DropMode, LockKey, LockPurpose};
-pub use config::{Config, Fixture, PoolSettings, Schema, SqlSource, SweepSettings};
+pub use config::{CONFIG_FILE, CONFIG_PATH_VAR, Config, PoolSettings, Schema, SweepSettings};
 pub use error::Error;
-pub use harness::{TestDb, run, url_of};
+pub use harness::{SchemaOverride, TestDb, TestSpec, run, run_with, url_of};
 pub use sqlx_testdb_macros::test;
-
-#[doc(hidden)]
-pub mod __private {
-    pub use sqlx::migrate::Migrator;
-}

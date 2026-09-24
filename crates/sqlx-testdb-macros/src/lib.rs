@@ -1,7 +1,6 @@
 //! `#[sqlx_testdb::test]`: runs an async sqlx test against its own throwaway database.
 
 mod args;
-mod config;
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -9,6 +8,8 @@ use syn::spanned::Spanned;
 use syn::{ItemFn, parse_macro_input};
 
 use crate::args::{Args, SchemaOverride};
+
+const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
 
 #[proc_macro_attribute]
 pub fn test(args: TokenStream, item: TokenStream) -> TokenStream {
@@ -33,13 +34,24 @@ fn expand(args: &Args, mut item: ItemFn) -> syn::Result<proc_macro2::TokenStream
             ));
         }
     };
-    let config = match &args.config {
-        Some(path) => quote! { &#path },
-        None => configured(args, item.sig.ident.span())?,
+    let config = args.config.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |path| quote! { ::core::option::Option::Some(#path as fn() -> ::sqlx_testdb::Config) },
+    );
+    let schema = match &args.schema {
+        None => quote! { ::core::option::Option::None },
+        Some(SchemaOverride::None) => {
+            quote! { ::core::option::Option::Some(::sqlx_testdb::SchemaOverride::None) }
+        }
+        Some(SchemaOverride::Migrator(path)) => quote! {
+            ::core::option::Option::Some(::sqlx_testdb::SchemaOverride::Migrator(&#path))
+        },
+        Some(SchemaOverride::Migrations(dir)) => quote! {
+            ::core::option::Option::Some(::sqlx_testdb::SchemaOverride::Migrations(#dir))
+        },
     };
-    let fixtures = args.fixtures.iter().map(|path| {
-        quote! { ::sqlx_testdb::Fixture { path: #path, sql: ::core::include_str!(#path) } }
-    });
+    let source_dir = source_dir().unwrap_or_default();
+    let fixtures = &args.fixtures;
     let attrs = std::mem::take(&mut item.attrs);
     let vis = std::mem::replace(&mut item.vis, syn::Visibility::Inherited);
     Ok(quote! {
@@ -47,33 +59,25 @@ fn expand(args: &Args, mut item: ItemFn) -> syn::Result<proc_macro2::TokenStream
         #[::core::prelude::v1::test]
         #vis fn #name() {
             #item
-            static FIXTURES: &[::sqlx_testdb::Fixture] = &[#(#fixtures),*];
+            static SPEC: ::sqlx_testdb::TestSpec = ::sqlx_testdb::TestSpec {
+                manifest_dir: ::core::env!("CARGO_MANIFEST_DIR"),
+                source_dir: #source_dir,
+                config: #config,
+                schema: #schema,
+                fixtures: &[#(#fixtures),*],
+            };
             ::sqlx_testdb::run(
-                #config,
+                &SPEC,
                 ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#name)),
-                FIXTURES,
                 #invoke,
             );
         }
     })
 }
 
-fn configured(args: &Args, span: proc_macro2::Span) -> syn::Result<proc_macro2::TokenStream> {
-    let file = config::File::find(span)?;
-    let schema = match &args.schema {
-        Some(SchemaOverride::None) => quote! { ::sqlx_testdb::Schema::None },
-        Some(SchemaOverride::Migrator(path)) => quote! { ::sqlx_testdb::Schema::Migrator(&#path) },
-        Some(SchemaOverride::Migrations(dir)) => {
-            let dir = config::manifest_relative(dir)?;
-            quote! { ::sqlx_testdb::Schema::Migrations(#dir) }
-        }
-        None => file.schema(),
-    };
-    let config = file.config(&schema);
-    let track = file.track();
-    Ok(quote! {{
-        #track
-        static CONFIG: ::sqlx_testdb::Config = #config;
-        &CONFIG
-    }})
+fn source_dir() -> Option<String> {
+    let manifest_dir = std::env::var_os(MANIFEST_DIR_VAR)?;
+    let file = std::env::current_dir().ok()?.join(proc_macro::Span::call_site().local_file()?);
+    let dir = file.parent()?.strip_prefix(manifest_dir).ok()?;
+    dir.to_str().map(str::to_owned)
 }

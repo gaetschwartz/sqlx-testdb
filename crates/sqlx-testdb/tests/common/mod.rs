@@ -2,8 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use camino::{Utf8Path, Utf8PathBuf};
 use sqlx::{Connection, PgConnection, PgPool};
-use sqlx_testdb::{Config, Schema, SqlSource};
+use sqlx_testdb::{Config, Schema};
 
 pub const BOOKKEEPING: &str = "sqlx_testdb_it";
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
@@ -16,24 +17,46 @@ pub fn token() -> String {
     bytes.iter().map(|b| char::from(ALPHABET[usize::from(*b) % ALPHABET.len()])).collect()
 }
 
-pub fn leak(text: String) -> &'static str {
-    text.leak()
-}
+pub struct Scratch(Utf8PathBuf);
 
-pub fn config(prefix: &str, bookkeeping: &str, root: &str, sql: &str) -> Config {
-    let sources: &'static [SqlSource] =
-        Box::leak(Box::new([SqlSource { path: "inline.sql", sql: leak(sql.to_owned()) }]));
-    Config {
-        schema: Schema::Sql(sources),
-        project_root: leak(root.to_owned()),
-        prefix: leak(prefix.to_owned()),
-        bookkeeping_schema: leak(bookkeeping.to_owned()),
-        ..Config::DEFAULT
+impl Scratch {
+    pub fn new() -> Self {
+        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("sqlx-testdb-{}", token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &Utf8Path {
+        &self.0
+    }
+
+    pub fn write(&self, name: &str, contents: &str) -> Utf8PathBuf {
+        let path = self.0.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+        path
     }
 }
 
-pub fn leak_config(config: Config) -> &'static Config {
-    Box::leak(Box::new(config))
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn config(scratch: &Scratch, prefix: &str, bookkeeping: &str, root: &str, sql: &str) -> Config {
+    let schema = scratch.write(&format!("{}.sql", token()), sql);
+    Config {
+        schema: Schema::Sql(vec![schema]),
+        project_root: Utf8PathBuf::from(root),
+        prefix: prefix.to_owned(),
+        bookkeeping_schema: bookkeeping.to_owned(),
+        ..Config::default()
+    }
 }
 
 pub fn block_on<F: Future>(future: F) -> F::Output {

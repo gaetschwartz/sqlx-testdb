@@ -1,37 +1,83 @@
+use std::borrow::Cow;
 use std::panic::AssertUnwindSafe;
 
+use camino::{Utf8Path, Utf8PathBuf};
 use futures_util::FutureExt;
 use snafu::{Report, ResultExt};
+use sqlx::migrate::Migrator;
 use sqlx::pool::PoolOptions;
 use sqlx::{Connection, Pool};
 
 use crate::args::{TestArgs, TestOutcome};
 use crate::backend::{Backend, ConnectOptionsOf, DropMode, LockKey, LockPurpose};
-use crate::config::{Config, Fixture};
+use crate::config::{Config, PoolSettings, Schema};
 use crate::error::{
-    ApplyFixtureSnafu, BookkeepingSnafu, ConnectOptionsSnafu, ConnectSnafu, DatabaseUrlSnafu,
-    Error, MissingDatabaseUrlSnafu, RuntimeSnafu,
+    ApplyFixtureSnafu, BookkeepingSnafu, ConnectOptionsSnafu, ConnectSnafu, Error,
+    ReadFixtureSnafu, RuntimeSnafu,
 };
 use crate::name::{self, Names};
 use crate::schema::LoadedSchema;
 use crate::{sweep, template};
 
 const MASTER_POOL_MAX_CONNECTIONS: u32 = 1;
+const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
 
-pub struct Ctx {
-    pub config: &'static Config,
-    pub names: Names,
+pub struct Ctx<'a> {
+    pub config: &'a Config,
+    pub names: Names<'a>,
     pub template: String,
     pub template_key: LockKey,
     pub sweep_key: LockKey,
 }
 
-pub fn run<DB, A, F, Fut>(
-    config: &'static Config,
-    test_path: &'static str,
-    fixtures: &'static [Fixture],
-    test: F,
-) where
+#[derive(Debug, Clone, Copy)]
+pub enum SchemaOverride {
+    None,
+    Migrator(&'static Migrator),
+    Migrations(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TestSpec {
+    pub manifest_dir: &'static str,
+    pub source_dir: &'static str,
+    pub config: Option<fn() -> Config>,
+    pub schema: Option<SchemaOverride>,
+    pub fixtures: &'static [&'static str],
+}
+
+pub fn run<DB, A, F, Fut>(spec: &TestSpec, test_path: &str, test: F)
+where
+    DB: Backend,
+    A: TestArgs<DB>,
+    F: FnOnce(A) -> Fut,
+    Fut: Future,
+    Fut::Output: TestOutcome,
+{
+    let manifest_dir =
+        std::env::var(MANIFEST_DIR_VAR).map_or(Cow::Borrowed(spec.manifest_dir), Cow::Owned);
+    let manifest_dir = Utf8Path::new(manifest_dir.as_ref());
+    let mut config = spec.config.map_or_else(
+        || match Config::discover(manifest_dir) {
+            Ok(config) => Cow::Borrowed(config),
+            Err(e) => panic!("{test_path}: {}", Report::from_error(e)),
+        },
+        |make| Cow::Owned(make()),
+    );
+    if let Some(schema) = spec.schema {
+        config.to_mut().schema = match schema {
+            SchemaOverride::None => Schema::None,
+            SchemaOverride::Migrator(migrator) => Schema::Migrator(migrator),
+            SchemaOverride::Migrations(dir) => Schema::Migrations(manifest_dir.join(dir)),
+        };
+    }
+    let source_dir = manifest_dir.join(spec.source_dir);
+    let fixtures: Vec<Utf8PathBuf> = spec.fixtures.iter().map(|f| source_dir.join(f)).collect();
+    run_with(&config, test_path, &fixtures, test);
+}
+
+pub fn run_with<DB, A, F, Fut>(config: &Config, test_path: &str, fixtures: &[Utf8PathBuf], test: F)
+where
     DB: Backend,
     A: TestArgs<DB>,
     F: FnOnce(A) -> Fut,
@@ -80,8 +126,10 @@ enum Verdict {
 
 pub struct TestDb<DB: Backend> {
     name: String,
-    test_path: &'static str,
-    config: &'static Config,
+    test_path: String,
+    bookkeeping_schema: String,
+    keep_failed: bool,
+    pool_settings: PoolSettings,
     master: Pool<DB>,
     options: ConnectOptionsOf<DB>,
     pool: Pool<DB>,
@@ -93,7 +141,7 @@ impl<DB: Backend> TestDb<DB> {
     }
 
     pub fn pool_options(&self) -> PoolOptions<DB> {
-        pool_options(self.config)
+        pool_options(self.pool_settings)
     }
 
     pub const fn connect_options(&self) -> &ConnectOptionsOf<DB> {
@@ -105,20 +153,20 @@ impl<DB: Backend> TestDb<DB> {
     }
 
     async fn create(
-        config: &'static Config,
-        test_path: &'static str,
-        fixtures: &'static [Fixture],
+        config: &Config,
+        test_path: &str,
+        fixtures: &[Utf8PathBuf],
     ) -> Result<Self, Error> {
-        let names = Names { prefix: config.prefix, bookkeeping_schema: config.bookkeeping_schema }
-            .validate(DB::MAX_IDENTIFIER_BYTES)?;
-        let var = config.database_url_var;
-        let url = match std::env::var(var) {
-            Ok(url) => url,
-            Err(std::env::VarError::NotPresent) => return MissingDatabaseUrlSnafu { var }.fail(),
-            Err(source) => return Err(source).context(DatabaseUrlSnafu { var }),
-        };
-        let server = DB::parse_options(&url).context(ConnectOptionsSnafu { var })?;
-        let schema = LoadedSchema::load(config.schema).await?;
+        let names =
+            Names { prefix: &config.prefix, bookkeeping_schema: &config.bookkeeping_schema }
+                .validate(DB::MAX_IDENTIFIER_BYTES)?;
+        let url = config.database_url()?;
+        let server = DB::parse_options(&url).context(ConnectOptionsSnafu)?;
+        let schema = LoadedSchema::load(&config.schema).await?;
+        let mut fixture_sql = Vec::with_capacity(fixtures.len());
+        for path in fixtures {
+            fixture_sql.push(std::fs::read_to_string(path).context(ReadFixtureSnafu { path })?);
+        }
         let ctx = Ctx {
             config,
             names,
@@ -139,11 +187,15 @@ impl<DB: Backend> TestDb<DB> {
         DB::bootstrap(&mut conn, names.bookkeeping_schema, bootstrap_key)
             .await
             .context(BookkeepingSnafu)?;
-        let run = name::current_run_key(config.project_root);
-        let first_of_run =
-            DB::register_run(&mut conn, names.bookkeeping_schema, &run, config.project_root)
-                .await
-                .context(BookkeepingSnafu)?;
+        let run = name::current_run_key(config.project_root.as_str());
+        let first_of_run = DB::register_run(
+            &mut conn,
+            names.bookkeeping_schema,
+            &run,
+            config.project_root.as_str(),
+        )
+        .await
+        .context(BookkeepingSnafu)?;
         if first_of_run {
             sweep::sweep::<DB>(&mut conn, &ctx).await?;
         }
@@ -160,23 +212,32 @@ impl<DB: Backend> TestDb<DB> {
         }
         drop(conn);
         let options = DB::options_for_database(&server, &name);
-        let pool = pool_options(config).connect_lazy_with(options.clone());
-        let db = Self { name, test_path, config, master, options, pool };
-        if let Err(e) = db.apply_fixtures(fixtures).await {
+        let pool = pool_options(config.pool).connect_lazy_with(options.clone());
+        let db = Self {
+            name,
+            test_path: test_path.to_owned(),
+            bookkeeping_schema: config.bookkeeping_schema.clone(),
+            keep_failed: config.keep_failed,
+            pool_settings: config.pool,
+            master,
+            options,
+            pool,
+        };
+        if let Err(e) = db.apply_fixtures(fixtures, &fixture_sql).await {
             db.finish(Verdict::Discard).await;
             return Err(e);
         }
         Ok(db)
     }
 
-    async fn apply_fixtures(&self, fixtures: &'static [Fixture]) -> Result<(), Error> {
-        if fixtures.is_empty() {
+    async fn apply_fixtures(&self, paths: &[Utf8PathBuf], sql: &[String]) -> Result<(), Error> {
+        if sql.is_empty() {
             return Ok(());
         }
         let mut conn = self.connect().await?;
-        for fixture in fixtures {
-            let applied = DB::apply_sql(&mut conn, fixture.sql).await;
-            applied.context(ApplyFixtureSnafu { path: fixture.path, name: &self.name })?;
+        for (path, sql) in paths.iter().zip(sql) {
+            let applied = DB::apply_sql(&mut conn, sql).await;
+            applied.context(ApplyFixtureSnafu { path, name: &self.name })?;
         }
         conn.close().await.context(ConnectSnafu)
     }
@@ -185,14 +246,14 @@ impl<DB: Backend> TestDb<DB> {
         self.pool.close().await;
         let mut conn = self.master.acquire().await.context(ConnectSnafu)?;
         template::drop::<DB>(&mut conn, &self.name, DropMode::Force).await?;
-        DB::forget_database(&mut conn, self.config.bookkeeping_schema, &self.name)
+        DB::forget_database(&mut conn, &self.bookkeeping_schema, &self.name)
             .await
             .context(BookkeepingSnafu)
     }
 
     async fn finish(&self, verdict: Verdict) {
-        let (test_path, name) = (self.test_path, self.name.as_str());
-        if verdict == Verdict::Discard || !self.config.keep_failed {
+        let (test_path, name) = (self.test_path.as_str(), self.name.as_str());
+        if verdict == Verdict::Discard || !self.keep_failed {
             if let Err(e) = self.drop_database().await {
                 eprintln!("{test_path}: could not drop {name}: {}", Report::from_error(e));
             }
@@ -200,7 +261,7 @@ impl<DB: Backend> TestDb<DB> {
         }
         self.pool.close().await;
         let marked = match self.master.acquire().await {
-            Ok(mut conn) => DB::mark_failed(&mut conn, self.config.bookkeeping_schema, name).await,
+            Ok(mut conn) => DB::mark_failed(&mut conn, &self.bookkeeping_schema, name).await,
             Err(e) => Err(e),
         };
         match marked {
@@ -216,8 +277,7 @@ pub fn url_of<DB: sqlx::Database>(pool: &Pool<DB>) -> String {
     sqlx::ConnectOptions::to_url_lossy(&*pool.connect_options()).into()
 }
 
-fn pool_options<DB: Backend>(config: &Config) -> PoolOptions<DB> {
-    let settings = config.pool;
+fn pool_options<DB: Backend>(settings: PoolSettings) -> PoolOptions<DB> {
     PoolOptions::new()
         .max_connections(settings.max_connections)
         .idle_timeout(settings.idle_timeout)
