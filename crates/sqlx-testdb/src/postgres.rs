@@ -6,12 +6,14 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, Executor, PgConnection, Postgres};
 
 use crate::args::TestArgs;
-use crate::backend::{Backend, DropMode, LockKey};
+use crate::backend::{Backend, ConnectFailure, DropMode, LockKey};
 use crate::error::Error;
 use crate::harness::TestDb;
 
 const OBJECT_IN_USE: &str = "55006";
 const INVALID_CATALOG_NAME: &str = "3D000";
+const TOO_MANY_CONNECTIONS: &str = "53300";
+const CANNOT_CONNECT_NOW: &str = "57P03";
 
 impl Backend for Postgres {
     const MAX_IDENTIFIER_BYTES: usize = 63;
@@ -43,6 +45,18 @@ impl Backend for Postgres {
 
     fn is_missing(error: &sqlx::Error) -> bool {
         has_code(error, INVALID_CATALOG_NAME)
+    }
+
+    fn classify_connect_error(error: &sqlx::Error) -> ConnectFailure {
+        match error {
+            sqlx::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
+                ConnectFailure::Refused
+            }
+            sqlx::Error::Database(database) => {
+                database.code().map_or(ConnectFailure::Rejected, |code| classify_code(&code))
+            }
+            _ => ConnectFailure::Unreachable,
+        }
     }
 
     async fn lock(conn: &mut PgConnection, key: LockKey) -> Result<(), sqlx::Error> {
@@ -325,6 +339,13 @@ impl TestArgs<Postgres> for PgConnectOptions {
     }
 }
 
+fn classify_code(code: &str) -> ConnectFailure {
+    match code {
+        TOO_MANY_CONNECTIONS | CANNOT_CONNECT_NOW => ConnectFailure::Busy,
+        _ => ConnectFailure::Rejected,
+    }
+}
+
 const fn advisory(key: LockKey) -> i64 {
     i64::from_be_bytes(key.bytes())
 }
@@ -336,6 +357,24 @@ fn has_code(error: &sqlx::Error, code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_connection_is_retryable_and_other_io_is_unreachable() {
+        let refused = sqlx::Error::Io(std::io::ErrorKind::ConnectionRefused.into());
+        assert_eq!(Postgres::classify_connect_error(&refused), ConnectFailure::Refused);
+        let lookup = sqlx::Error::Io(std::io::Error::other("failed to lookup address"));
+        assert_eq!(Postgres::classify_connect_error(&lookup), ConnectFailure::Unreachable);
+        let tls = sqlx::Error::Tls("handshake failed".into());
+        assert_eq!(Postgres::classify_connect_error(&tls), ConnectFailure::Unreachable);
+    }
+
+    #[test]
+    fn a_full_or_starting_server_is_busy_and_other_codes_are_rejections() {
+        assert_eq!(classify_code("53300"), ConnectFailure::Busy);
+        assert_eq!(classify_code("57P03"), ConnectFailure::Busy);
+        assert_eq!(classify_code("28P01"), ConnectFailure::Rejected);
+        assert_eq!(classify_code("3D000"), ConnectFailure::Rejected);
+    }
 
     #[test]
     fn quoting_doubles_embedded_quotes() {

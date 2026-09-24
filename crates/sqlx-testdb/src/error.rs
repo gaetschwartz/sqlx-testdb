@@ -17,6 +17,16 @@ pub enum Error {
     ReadConfig { path: Utf8PathBuf, source: std::io::Error },
     #[snafu(display("parsing {path}"))]
     ParseConfig { path: Utf8PathBuf, source: toml::de::Error },
+    #[snafu(display("{path}: `{key}` must be positive"))]
+    NonPositiveSetting { path: Utf8PathBuf, key: &'static str },
+    #[snafu(display("cannot reach the test database server at {url}"))]
+    Unreachable { url: String, source: sqlx::Error },
+    #[snafu(display("the test database server at {url} did not answer within {timeout_secs} s"))]
+    ConnectTimeout { url: String, timeout_secs: u64 },
+    #[snafu(display("the test database server at {url} refused the connection"))]
+    Rejected { url: String, source: sqlx::Error },
+    #[snafu(display("{source}"))]
+    Probe { source: std::sync::Arc<Self> },
     #[snafu(display("{path}: set `schema.sql` or `schema.migrations`, not both"))]
     ConflictingSchema { path: Utf8PathBuf },
     #[snafu(display("reading schema file {path}"))]

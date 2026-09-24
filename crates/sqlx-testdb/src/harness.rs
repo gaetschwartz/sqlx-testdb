@@ -17,7 +17,7 @@ use crate::error::{
 };
 use crate::name::{self, Names};
 use crate::schema::LoadedSchema;
-use crate::{sweep, template};
+use crate::{probe, sweep, template};
 
 const MASTER_POOL_MAX_CONNECTIONS: u32 = 1;
 const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
@@ -162,6 +162,7 @@ impl<DB: Backend> TestDb<DB> {
                 .validate(DB::MAX_IDENTIFIER_BYTES)?;
         let url = config.database_url()?;
         let server = DB::parse_options(&url).context(ConnectOptionsSnafu)?;
+        probe::ensure_reachable::<DB>(&url, &server, config.pool.connect_timeout).await?;
         let schema = LoadedSchema::load(&config.schema).await?;
         let mut fixture_sql = Vec::with_capacity(fixtures.len());
         for path in fixtures {

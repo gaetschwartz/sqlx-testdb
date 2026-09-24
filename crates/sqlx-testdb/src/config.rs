@@ -7,8 +7,8 @@ use snafu::ResultExt;
 use sqlx::migrate::Migrator;
 
 use crate::error::{
-    ConflictingSchemaSnafu, DatabaseUrlSnafu, Error, MissingDatabaseUrlSnafu, ParseConfigSnafu,
-    ReadConfigSnafu,
+    ConflictingSchemaSnafu, DatabaseUrlSnafu, Error, MissingDatabaseUrlSnafu,
+    NonPositiveSettingSnafu, ParseConfigSnafu, ReadConfigSnafu,
 };
 
 pub const CONFIG_FILE: &str = "sqlx-testdb.toml";
@@ -43,6 +43,7 @@ pub struct PoolSettings {
     pub max_connections: u32,
     pub idle_timeout: Duration,
     pub acquire_timeout: Duration,
+    pub connect_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +57,8 @@ impl PoolSettings {
     pub const DEFAULT: Self = Self {
         max_connections: 4,
         idle_timeout: Duration::from_secs(1),
-        acquire_timeout: Duration::from_secs(2 * SECS_PER_MIN),
+        acquire_timeout: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(5),
     };
 }
 
@@ -115,6 +117,7 @@ struct PoolFile {
     max_connections: Option<u32>,
     idle_timeout_secs: Option<u64>,
     acquire_timeout_secs: Option<u64>,
+    connect_timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -167,6 +170,12 @@ impl Config {
         };
         let defaults = Self::default();
         let (pool, sweep) = (settings.pool, settings.sweep);
+        for (key, value) in [
+            ("pool.acquire_timeout_secs", pool.acquire_timeout_secs),
+            ("pool.connect_timeout_secs", pool.connect_timeout_secs),
+        ] {
+            snafu::ensure!(value != Some(0), NonPositiveSettingSnafu { path, key });
+        }
         let (pool_defaults, sweep_defaults) = (PoolSettings::DEFAULT, SweepSettings::DEFAULT);
         Ok(Self {
             schema,
@@ -184,6 +193,11 @@ impl Config {
                     pool.acquire_timeout_secs,
                     1,
                     pool_defaults.acquire_timeout,
+                ),
+                connect_timeout: duration(
+                    pool.connect_timeout_secs,
+                    1,
+                    pool_defaults.connect_timeout,
                 ),
             },
             sweep: SweepSettings {
@@ -240,6 +254,23 @@ mod tests {
             source: Some(Utf8PathBuf::from("/p/sqlx-testdb.toml")),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn a_zero_timeout_is_rejected_naming_the_key() {
+        let dir = std::env::temp_dir().join(format!("sqlx-testdb-zero-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join(CONFIG_FILE)).unwrap();
+        for key in ["acquire_timeout_secs", "connect_timeout_secs"] {
+            std::fs::write(&path, format!("[pool]\n{key} = 0\n")).unwrap();
+            let error = Config::from_file(&path).unwrap_err();
+            assert_eq!(error.to_string(), format!("{path}: `pool.{key}` must be positive"));
+        }
+        std::fs::write(&path, "[pool]\nconnect_timeout_secs = 7\n").unwrap();
+        let config = Config::from_file(&path).unwrap();
+        assert_eq!(config.pool.connect_timeout, Duration::from_secs(7));
+        assert_eq!(config.pool.acquire_timeout, Duration::from_secs(30));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

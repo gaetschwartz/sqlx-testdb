@@ -14,6 +14,16 @@ pub enum DropMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailure {
+    /// Nothing listens there yet; worth retrying briefly in case the server is restarting.
+    Refused,
+    Unreachable,
+    Rejected,
+    /// The server is up but cannot take a connection right now.
+    Busy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockPurpose {
     Bootstrap,
     Sweep,
@@ -70,6 +80,8 @@ pub trait Backend: Database {
     fn is_in_use(error: &sqlx::Error) -> bool;
 
     fn is_missing(error: &sqlx::Error) -> bool;
+
+    fn classify_connect_error(error: &sqlx::Error) -> ConnectFailure;
 
     fn lock(
         conn: &mut Self::Connection,

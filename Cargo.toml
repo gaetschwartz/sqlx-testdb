@@ -23,6 +23,7 @@ must_use_candidate = "allow"
 [workspace.dependencies]
 camino = { version = "1.2.6", features = ["serde1"] }
 futures-util = "0.3.34"
+parking_lot = "0.12.5"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
 rand = "0.10.2"
@@ -31,5 +32,6 @@ sha2 = "0.11.0"
 snafu = { version = "0.9.2", features = ["backtrace"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "migrate"] }
 syn = { version = "2.0.119", features = ["full"] }
-tokio = { version = "1.53.1", features = ["rt"] }
+tokio = { version = "1.53.1", features = ["rt", "time"] }
 toml = "1.1.6"
+url = "2.5.8"

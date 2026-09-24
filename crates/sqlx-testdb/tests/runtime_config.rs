@@ -12,7 +12,6 @@ const CHILD_TEST: &str = "a_test_under_the_runtime_configuration";
 const OUT_VAR: &str = "SQLX_TESTDB_CHILD_OUT";
 const CONFIG_VAR: &str = "SQLX_TESTDB_CONFIG";
 const URL_VAR: &str = "DATABASE_URL";
-const UNREACHABLE_TIMEOUT_SECS: u64 = 2;
 const UNREACHABLE_URL: &str = "postgres://nobody:nothing@127.0.0.1:1/nowhere";
 
 #[sqlx_testdb::test]
@@ -122,10 +121,7 @@ fn url_config(scratch: &Scratch, prefix: &str, database_url: Option<&str>) -> St
     scratch
         .write(
             "sqlx-testdb.toml",
-            &format!(
-                "prefix = \"{prefix}\"\nbookkeeping_schema = \"{BOOKKEEPING}\"\n{url_line}\
-                 [pool]\nacquire_timeout_secs = {UNREACHABLE_TIMEOUT_SECS}\n"
-            ),
+            &format!("prefix = \"{prefix}\"\nbookkeeping_schema = \"{BOOKKEEPING}\"\n{url_line}"),
         )
         .into_string()
 }
@@ -137,7 +133,13 @@ fn the_database_url_comes_from_the_environment_first_then_the_file() {
     let config = url_config(&scratch, &prefix, Some(&server_url()));
     assert!(child(&scratch, Some(&config), None).status.success(), "the file alone suffices");
     let env_wins = stderr(&child(&scratch, Some(&config), Some(UNREACHABLE_URL)));
-    assert!(env_wins.contains("connecting to the test server"), "{env_wins}");
+    assert!(
+        env_wins.contains(
+            "cannot reach the test database server at \
+             postgres://nobody:redacted@127.0.0.1:1/nowhere"
+        ),
+        "{env_wins}"
+    );
 
     let config = url_config(&scratch, &prefix, None);
     assert!(child(&scratch, Some(&config), Some(&server_url())).status.success());

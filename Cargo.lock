@@ -1328,6 +1328,7 @@ version = "0.1.0"
 dependencies = [
  "camino",
  "futures-util",
+ "parking_lot",
  "rand 0.10.3",
  "serde",
  "sha2 0.11.0",
@@ -1336,6 +1337,7 @@ dependencies = [
  "sqlx-testdb-macros",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]
