@@ -1,0 +1,30 @@
+[package]
+name = "sqlx-testdb"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+
+[dependencies]
+camino.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+sha2.workspace = true
+snafu.workspace = true
+sqlx.workspace = true
+sqlx-testdb-macros = { version = "0.1.0", path = "../sqlx-testdb-macros" }
+tokio.workspace = true
+
+[features]
+default = ["postgres"]
+postgres = ["sqlx/postgres"]
+
+[dev-dependencies]
+rand.workspace = true
+sqlx = { workspace = true, features = ["postgres", "macros"] }
+tokio = { workspace = true, features = ["time"] }

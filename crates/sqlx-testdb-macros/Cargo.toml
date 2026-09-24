@@ -1,0 +1,20 @@
+[package]
+name = "sqlx-testdb-macros"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+serde.workspace = true
+syn.workspace = true
+toml.workspace = true

@@ -1,0 +1,8 @@
+prefix = "sqlxt_it"
+bookkeeping_schema = "sqlx_testdb_it"
+
+[schema]
+sql = ["tests/schema/widgets.sql", "tests/schema/widget_tags.sql"]
+
+[pool]
+max_connections = 2
