@@ -26,9 +26,9 @@ fn passing(config: &Config, test_path: &str) -> String {
 }
 
 async fn failed_at_is_set(conn: &mut PgConnection, bookkeeping: &str, name: &str) -> bool {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         r#"SELECT failed_at IS NOT NULL FROM "{bookkeeping}".databases WHERE name = $1"#
-    ))
+    )))
     .bind(name)
     .fetch_one(conn)
     .await
@@ -36,9 +36,9 @@ async fn failed_at_is_set(conn: &mut PgConnection, bookkeeping: &str, name: &str
 }
 
 async fn is_recorded(conn: &mut PgConnection, bookkeeping: &str, table: &str, name: &str) -> bool {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         r#"SELECT EXISTS (SELECT 1 FROM "{bookkeeping}".{table} WHERE name = $1)"#
-    ))
+    )))
     .bind(name)
     .fetch_one(conn)
     .await
@@ -234,9 +234,9 @@ fn the_first_test_of_a_run_sweeps_leftovers_without_forcing() {
     block_on(async {
         let mut conn = admin().await;
         assert!(!exists(&mut conn, &busy).await);
-        let stale_run: bool = sqlx::query_scalar(&format!(
+        let stale_run: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             r#"SELECT EXISTS (SELECT 1 FROM "{b}".runs WHERE run = 'stale')"#
-        ))
+        )))
         .fetch_one(&mut conn)
         .await
         .unwrap();
@@ -256,7 +256,9 @@ fn hold_connection(database: &str) -> std::sync::mpsc::Sender<()> {
             let url = std::env::var("DATABASE_URL").unwrap();
             let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
             let conn: PgConnection =
-                sqlx::Connection::connect_with(&options.database(&database)).await.unwrap();
+                <PgConnection as sqlx::Connection>::connect_with(&options.database(&database))
+                    .await
+                    .unwrap();
             connected.send(()).unwrap();
             released.recv().unwrap();
             sqlx::Connection::close(conn).await.unwrap();

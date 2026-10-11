@@ -95,7 +95,7 @@ impl Backend for Postgres {
 
     async fn create_database(conn: &mut PgConnection, name: &str) -> Result<(), sqlx::Error> {
         let name = Self::quote_identifier(name);
-        conn.execute(format!("CREATE DATABASE {name}").as_str()).await?;
+        conn.execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).await?;
         Ok(())
     }
 
@@ -105,7 +105,8 @@ impl Backend for Postgres {
         template: &str,
     ) -> Result<(), sqlx::Error> {
         let (name, template) = (Self::quote_identifier(name), Self::quote_identifier(template));
-        conn.execute(format!("CREATE DATABASE {name} TEMPLATE {template}").as_str()).await?;
+        conn.execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name} TEMPLATE {template}")))
+            .await?;
         Ok(())
     }
 
@@ -119,7 +120,7 @@ impl Backend for Postgres {
             DropMode::Force => format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
             DropMode::IfIdle => format!("DROP DATABASE IF EXISTS {name}"),
         };
-        conn.execute(statement.as_str()).await?;
+        conn.execute(sqlx::AssertSqlSafe(statement)).await?;
         Ok(())
     }
 
@@ -134,19 +135,19 @@ impl Backend for Postgres {
             "ALTER DATABASE {building} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false;
              ALTER DATABASE {building} RENAME TO {template}"
         );
-        sqlx::raw_sql(&publish).execute(conn).await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(publish)).execute(conn).await?;
         Ok(())
     }
 
     async fn retire_template(conn: &mut PgConnection, name: &str) -> Result<(), sqlx::Error> {
         let name = Self::quote_identifier(name);
         let retire = format!("ALTER DATABASE {name} WITH IS_TEMPLATE false ALLOW_CONNECTIONS true");
-        conn.execute(retire.as_str()).await?;
+        conn.execute(sqlx::AssertSqlSafe(retire)).await?;
         Ok(())
     }
 
     async fn apply_sql(conn: &mut PgConnection, sql: &str) -> Result<(), sqlx::Error> {
-        sqlx::raw_sql(sql).execute(conn).await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
         Ok(())
     }
 
@@ -154,7 +155,7 @@ impl Backend for Postgres {
         conn: &mut PgConnection,
         migrator: &Migrator,
     ) -> Result<(), MigrateError> {
-        migrator.run_direct(conn).await
+        migrator.run_direct(None, conn, false).await
     }
 
     async fn bootstrap(
@@ -187,7 +188,7 @@ impl Backend for Postgres {
             .bind(advisory(key))
             .execute(&mut *tx)
             .await?;
-        sqlx::raw_sql(&ddl).execute(&mut *tx).await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(ddl)).execute(&mut *tx).await?;
         tx.commit().await
     }
 
@@ -203,7 +204,11 @@ impl Backend for Postgres {
              ON CONFLICT (run) DO UPDATE SET last_seen_at = now()
              RETURNING xmax = 0"
         );
-        sqlx::query_scalar(&sql).bind(run).bind(project_root).fetch_one(conn).await
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(run)
+            .bind(project_root)
+            .fetch_one(conn)
+            .await
     }
 
     async fn register_database(
@@ -215,7 +220,12 @@ impl Backend for Postgres {
     ) -> Result<(), sqlx::Error> {
         let s = Self::quote_identifier(schema);
         let sql = format!("INSERT INTO {s}.databases (name, test_path, run) VALUES ($1, $2, $3)");
-        sqlx::query(&sql).bind(name).bind(test_path).bind(run).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(name)
+            .bind(test_path)
+            .bind(run)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
@@ -226,7 +236,7 @@ impl Backend for Postgres {
     ) -> Result<(), sqlx::Error> {
         let s = Self::quote_identifier(schema);
         let sql = format!("UPDATE {s}.databases SET failed_at = now() WHERE name = $1");
-        sqlx::query(&sql).bind(name).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(name).execute(conn).await?;
         Ok(())
     }
 
@@ -237,7 +247,7 @@ impl Backend for Postgres {
     ) -> Result<(), sqlx::Error> {
         let s = Self::quote_identifier(schema);
         let sql = format!("DELETE FROM {s}.databases WHERE name = $1");
-        sqlx::query(&sql).bind(name).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(name).execute(conn).await?;
         Ok(())
     }
 
@@ -251,7 +261,7 @@ impl Backend for Postgres {
             "INSERT INTO {s}.templates (name) VALUES ($1)
              ON CONFLICT (name) DO UPDATE SET last_used_at = now()"
         );
-        sqlx::query(&sql).bind(name).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(name).execute(conn).await?;
         Ok(())
     }
 
@@ -262,7 +272,7 @@ impl Backend for Postgres {
     ) -> Result<(), sqlx::Error> {
         let s = Self::quote_identifier(schema);
         let sql = format!("DELETE FROM {s}.templates WHERE name = $1");
-        sqlx::query(&sql).bind(name).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(name).execute(conn).await?;
         Ok(())
     }
 
@@ -281,7 +291,7 @@ impl Backend for Postgres {
                          OR r.last_seen_at < now() - make_interval(secs => $1)))
                 OR d.failed_at < now() - make_interval(secs => $2)"
         );
-        sqlx::query_scalar(&sql)
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(stale_run_after.as_secs_f64())
             .bind(kept_failed_for.as_secs_f64())
             .fetch_all(conn)
@@ -299,7 +309,10 @@ impl Backend for Postgres {
              WHERE r.last_seen_at < now() - make_interval(secs => $1)
                AND NOT EXISTS (SELECT 1 FROM {s}.databases d WHERE d.run = r.run)"
         );
-        sqlx::query(&sql).bind(stale_run_after.as_secs_f64()).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(stale_run_after.as_secs_f64())
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
@@ -318,7 +331,7 @@ impl Backend for Postgres {
                                WHERE t.name = datname
                                  AND t.last_used_at >= now() - make_interval(secs => $3))"
         );
-        sqlx::query_scalar(&sql)
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(prefix)
             .bind(current)
             .bind(idle_after.as_secs_f64())

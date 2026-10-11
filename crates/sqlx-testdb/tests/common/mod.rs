@@ -98,7 +98,7 @@ pub async fn is_template(conn: &mut PgConnection, name: &str) -> bool {
 }
 
 pub async fn execute(conn: &mut PgConnection, sql: &str) {
-    sqlx::raw_sql(sql).execute(conn).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(conn).await.unwrap();
 }
 
 pub async fn drop_all(conn: &mut PgConnection, prefix: &str) {
