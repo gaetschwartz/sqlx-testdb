@@ -271,3 +271,52 @@ fn hold_connection(database: &str) -> std::sync::mpsc::Sender<()> {
 async fn current_template(conn: &mut PgConnection, prefix: &str) -> String {
     with_prefix(conn, &format!("{prefix}_template_")).await.remove(0)
 }
+
+async fn template_is_fresh(conn: &mut PgConnection, bookkeeping: &str) -> bool {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT bool_and(last_used_at > now() - interval '1 hour') FROM "{bookkeeping}".templates"#
+    )))
+    .fetch_one(conn)
+    .await
+    .unwrap()
+}
+
+#[test]
+fn only_the_first_test_of_a_run_sweeps_and_touches_the_template() {
+    let scratch = Scratch::new();
+    let prefix = format!("it{}", token());
+    let bookkeeping = format!("sqlx_testdb_once_{}", token());
+    let config = config(&scratch, &prefix, &bookkeeping, &token(), SCHEMA);
+    let b = &bookkeeping;
+    let leftover = format!("{prefix}_leftover");
+    passing(&config, "lifecycle::once_first");
+    block_on(async {
+        let mut conn = admin().await;
+        execute(&mut conn, &format!(r#"CREATE DATABASE "{leftover}""#)).await;
+        execute(
+            &mut conn,
+            &format!(
+                r#"INSERT INTO "{b}".runs (run, project_root, last_seen_at)
+                       VALUES ('gone', 'x', now() - interval '2 hours');
+                   INSERT INTO "{b}".databases (name, test_path, run)
+                       VALUES ('{leftover}', 't', 'gone');
+                   UPDATE "{b}".templates SET last_used_at = now() - interval '20 hours';"#
+            ),
+        )
+        .await;
+    });
+    passing(&config, "lifecycle::once_second");
+    block_on(async {
+        let mut conn = admin().await;
+        assert!(exists(&mut conn, &leftover).await, "a later test of the run swept");
+        assert!(!template_is_fresh(&mut conn, b).await, "a later test of the run touched");
+    });
+    passing(&Config { project_root: "once-other-run".into(), ..config }, "lifecycle::once_other");
+    block_on(async {
+        let mut conn = admin().await;
+        assert!(!exists(&mut conn, &leftover).await);
+        assert!(template_is_fresh(&mut conn, b).await, "the first test of a run did not touch");
+        drop_all(&mut conn, &prefix).await;
+        execute(&mut conn, &format!(r#"DROP SCHEMA "{b}" CASCADE"#)).await;
+    });
+}

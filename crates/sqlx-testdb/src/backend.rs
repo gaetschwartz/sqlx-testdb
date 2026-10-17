@@ -23,6 +23,14 @@ pub enum ConnectFailure {
     Busy,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Registration<'a> {
+    pub run: &'a str,
+    pub project_root: &'a str,
+    pub name: &'a str,
+    pub test_path: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockPurpose {
     Bootstrap,
@@ -146,27 +154,21 @@ pub trait Backend: Database {
         migrator: &Migrator,
     ) -> impl Future<Output = Result<(), MigrateError>>;
 
+    /// Creates the bookkeeping tables when any is missing; takes no lock when all exist.
     fn bootstrap(
         conn: &mut Self::Connection,
         schema: &str,
         key: LockKey,
     ) -> impl Future<Output = Result<(), sqlx::Error>>;
 
-    /// Records the run as seen now; `true` when this call created it.
-    fn register_run(
+    /// Registers `name` as `run`'s database in one statement, and records the run as seen unless
+    /// it was already seen within `refresh_after`; `true` when this call created the run.
+    fn register_test(
         conn: &mut Self::Connection,
         schema: &str,
-        run: &str,
-        project_root: &str,
+        registration: &Registration<'_>,
+        refresh_after: Duration,
     ) -> impl Future<Output = Result<bool, sqlx::Error>>;
-
-    fn register_database(
-        conn: &mut Self::Connection,
-        schema: &str,
-        name: &str,
-        test_path: &str,
-        run: &str,
-    ) -> impl Future<Output = Result<(), sqlx::Error>>;
 
     fn mark_failed(
         conn: &mut Self::Connection,
@@ -180,10 +182,12 @@ pub trait Backend: Database {
         name: &str,
     ) -> impl Future<Output = Result<(), sqlx::Error>>;
 
+    /// Records the template as used now, unless it was already used within `refresh_after`.
     fn touch_template(
         conn: &mut Self::Connection,
         schema: &str,
         name: &str,
+        refresh_after: Duration,
     ) -> impl Future<Output = Result<(), sqlx::Error>>;
 
     fn forget_template(

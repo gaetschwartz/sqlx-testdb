@@ -6,7 +6,7 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, Executor, PgConnection, Postgres};
 
 use crate::args::TestArgs;
-use crate::backend::{Backend, ConnectFailure, DropMode, LockKey};
+use crate::backend::{Backend, ConnectFailure, DropMode, LockKey, Registration};
 use crate::error::Error;
 use crate::harness::TestDb;
 
@@ -163,6 +163,9 @@ impl Backend for Postgres {
         schema: &str,
         key: LockKey,
     ) -> Result<(), sqlx::Error> {
+        if bookkeeping_exists(&mut *conn, schema).await? {
+            return Ok(());
+        }
         let s = Self::quote_identifier(schema);
         let ddl = format!(
             "CREATE SCHEMA IF NOT EXISTS {s};
@@ -188,45 +191,39 @@ impl Backend for Postgres {
             .bind(advisory(key))
             .execute(&mut *tx)
             .await?;
-        sqlx::raw_sql(sqlx::AssertSqlSafe(ddl)).execute(&mut *tx).await?;
+        if !bookkeeping_exists(&mut *tx, schema).await? {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(ddl)).execute(&mut *tx).await?;
+        }
         tx.commit().await
     }
 
-    async fn register_run(
+    async fn register_test(
         conn: &mut PgConnection,
         schema: &str,
-        run: &str,
-        project_root: &str,
+        registration: &Registration<'_>,
+        refresh_after: Duration,
     ) -> Result<bool, sqlx::Error> {
         let s = Self::quote_identifier(schema);
         let sql = format!(
-            "INSERT INTO {s}.runs (run, project_root) VALUES ($1, $2)
-             ON CONFLICT (run) DO UPDATE SET last_seen_at = now()
-             RETURNING xmax = 0"
+            "WITH seen AS (
+                 INSERT INTO {s}.runs AS r (run, project_root) VALUES ($1, $2)
+                 ON CONFLICT (run) DO UPDATE SET last_seen_at = now()
+                     WHERE r.last_seen_at < now() - make_interval(secs => $3)
+                 RETURNING xmax = 0 AS created
+             ), registered AS (
+                 INSERT INTO {s}.databases (name, test_path, run) VALUES ($4, $5, $1)
+                 RETURNING name
+             )
+             SELECT COALESCE((SELECT created FROM seen), false)"
         );
         sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(run)
-            .bind(project_root)
+            .bind(registration.run)
+            .bind(registration.project_root)
+            .bind(refresh_after.as_secs_f64())
+            .bind(registration.name)
+            .bind(registration.test_path)
             .fetch_one(conn)
             .await
-    }
-
-    async fn register_database(
-        conn: &mut PgConnection,
-        schema: &str,
-        name: &str,
-        test_path: &str,
-        run: &str,
-    ) -> Result<(), sqlx::Error> {
-        let s = Self::quote_identifier(schema);
-        let sql = format!("INSERT INTO {s}.databases (name, test_path, run) VALUES ($1, $2, $3)");
-        sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(name)
-            .bind(test_path)
-            .bind(run)
-            .execute(conn)
-            .await?;
-        Ok(())
     }
 
     async fn mark_failed(
@@ -255,13 +252,19 @@ impl Backend for Postgres {
         conn: &mut PgConnection,
         schema: &str,
         name: &str,
+        refresh_after: Duration,
     ) -> Result<(), sqlx::Error> {
         let s = Self::quote_identifier(schema);
         let sql = format!(
-            "INSERT INTO {s}.templates (name) VALUES ($1)
-             ON CONFLICT (name) DO UPDATE SET last_used_at = now()"
+            "INSERT INTO {s}.templates AS t (name) VALUES ($1)
+             ON CONFLICT (name) DO UPDATE SET last_used_at = now()
+                 WHERE t.last_used_at < now() - make_interval(secs => $2)"
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(name).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(name)
+            .bind(refresh_after.as_secs_f64())
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
@@ -357,6 +360,19 @@ fn classify_code(code: &str) -> ConnectFailure {
         TOO_MANY_CONNECTIONS | CANNOT_CONNECT_NOW => ConnectFailure::Busy,
         _ => ConnectFailure::Rejected,
     }
+}
+
+async fn bookkeeping_exists(conn: &mut PgConnection, schema: &str) -> Result<bool, sqlx::Error> {
+    let s = Postgres::quote_identifier(schema);
+    sqlx::query_scalar(
+        "SELECT to_regclass($1) IS NOT NULL AND to_regclass($2) IS NOT NULL
+                AND to_regclass($3) IS NOT NULL",
+    )
+    .bind(format!("{s}.runs"))
+    .bind(format!("{s}.databases"))
+    .bind(format!("{s}.templates"))
+    .fetch_one(conn)
+    .await
 }
 
 const fn advisory(key: LockKey) -> i64 {

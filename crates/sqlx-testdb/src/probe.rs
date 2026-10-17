@@ -9,54 +9,62 @@ use tokio::time::Instant;
 use crate::backend::{Backend, ConnectFailure, ConnectOptionsOf};
 use crate::error::Error;
 
-const REFUSED_RETRY_MILLIS: u64 = 250;
+const RETRY_MILLIS: u64 = 250;
 const REDACTED_PASSWORD: &str = "redacted";
 
-type Outcome = Result<(), Arc<Error>>;
-
-static PROBED: LazyLock<Mutex<HashMap<String, Outcome>>> =
+static PROBED: LazyLock<Mutex<HashMap<String, Arc<Error>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub async fn ensure_reachable<DB: Backend>(
+pub async fn connect<DB: Backend>(
     url: &str,
     options: &ConnectOptionsOf<DB>,
     timeout: Duration,
-) -> Result<(), Error> {
+    busy_timeout: Duration,
+) -> Result<DB::Connection, Error> {
     let cached = PROBED.lock().get(url).cloned();
-    let outcome = if let Some(outcome) = cached {
-        outcome
-    } else {
-        let outcome = probe::<DB>(url, options, timeout).await.map_err(Arc::new);
-        PROBED.lock().insert(url.to_owned(), outcome.clone());
-        outcome
-    };
-    outcome.map_err(|source| Error::Probe { source })
+    if let Some(failure) = cached {
+        return Err(Error::Probe { source: failure });
+    }
+    match attempt::<DB>(url, options, timeout, busy_timeout).await {
+        Ok(conn) => Ok(conn),
+        Err(error @ Error::Connect { .. }) => Err(error),
+        Err(error) => {
+            let failure = Arc::new(error);
+            PROBED.lock().insert(url.to_owned(), failure.clone());
+            Err(Error::Probe { source: failure })
+        }
+    }
 }
 
-async fn probe<DB: Backend>(
+async fn attempt<DB: Backend>(
     url: &str,
     options: &ConnectOptionsOf<DB>,
     timeout: Duration,
-) -> Result<(), Error> {
-    let deadline = Instant::now() + timeout;
-    let retry = Duration::from_millis(REFUSED_RETRY_MILLIS);
+    busy_timeout: Duration,
+) -> Result<DB::Connection, Error> {
+    let started = Instant::now();
+    let mut deadline = started + timeout;
+    let retry = Duration::from_millis(RETRY_MILLIS);
     loop {
-        let attempt = tokio::time::timeout_at(deadline, DB::Connection::connect_with(options));
-        let Ok(connected) = attempt.await else {
+        let connecting = tokio::time::timeout_at(deadline, DB::Connection::connect_with(options));
+        let Ok(connected) = connecting.await else {
             return Err(Error::ConnectTimeout {
                 url: redact(url),
-                timeout_secs: timeout.as_secs(),
+                timeout_secs: deadline.duration_since(started).as_secs(),
             });
         };
         let error = match connected {
-            Ok(conn) => {
-                let _ = conn.close().await;
-                return Ok(());
-            }
+            Ok(conn) => return Ok(conn),
             Err(error) => error,
         };
         match DB::classify_connect_error(&error) {
-            ConnectFailure::Busy => return Ok(()),
+            ConnectFailure::Busy => {
+                deadline = started + busy_timeout;
+                if Instant::now() + retry >= deadline {
+                    return Err(Error::Connect { source: error });
+                }
+                tokio::time::sleep(retry).await;
+            }
             ConnectFailure::Rejected => {
                 return Err(Error::Rejected { url: redact(url), source: error });
             }

@@ -13,6 +13,7 @@ use crate::error::{
 
 pub const CONFIG_FILE: &str = "sqlx-testdb.toml";
 pub const CONFIG_PATH_VAR: &str = "SQLX_TESTDB_CONFIG";
+const REFRESH_DIVISOR: f64 = 4.0;
 const SECS_PER_MIN: u64 = 60;
 const SECS_PER_HOUR: u64 = 60 * SECS_PER_MIN;
 
@@ -63,6 +64,14 @@ impl PoolSettings {
 }
 
 impl SweepSettings {
+    pub(crate) fn run_refresh_after(self) -> Duration {
+        self.stale_run_after.div_f64(REFRESH_DIVISOR)
+    }
+
+    pub(crate) fn template_refresh_after(self) -> Duration {
+        self.idle_template_after.div_f64(REFRESH_DIVISOR)
+    }
+
     pub const DEFAULT: Self = Self {
         stale_run_after: Duration::from_secs(SECS_PER_HOUR),
         kept_failed_for: Duration::from_secs(24 * SECS_PER_HOUR),

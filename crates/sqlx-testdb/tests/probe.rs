@@ -4,13 +4,14 @@ use std::panic::catch_unwind;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
-use sqlx_testdb::{Config, run_with};
+use sqlx_testdb::{Config, PoolSettings, run_with};
 
 use common::{BOOKKEEPING, token};
 
 const UNSET_VAR: &str = "SQLX_TESTDB_PROBE_UNSET";
 const WELL_UNDER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 const FAST: Duration = Duration::from_secs(3);
+const LIMITED: usize = 2;
 const CACHED: Duration = Duration::from_millis(500);
 
 fn config(url: &str) -> Config {
@@ -80,6 +81,83 @@ fn a_missing_database_fails_fast_with_the_reason() {
     assert!(first_line(&message).ends_with("refused the connection"), "{message}");
     assert!(message.contains(&format!("database \"{missing}\" does not exist")), "{message}");
     assert!(elapsed < FAST, "took {elapsed:?}");
+}
+
+fn hold_connections(url: &str, count: usize) -> std::sync::mpsc::Sender<()> {
+    let (release, released) = std::sync::mpsc::channel();
+    let (connected, is_connected) = std::sync::mpsc::channel();
+    let url = url.to_owned();
+    std::thread::spawn(move || {
+        common::block_on(async move {
+            let mut held = Vec::with_capacity(count);
+            for _ in 0..count {
+                held.push(<sqlx::PgConnection as sqlx::Connection>::connect(&url).await.unwrap());
+            }
+            connected.send(()).unwrap();
+            released.recv().unwrap();
+            drop(held);
+        });
+    });
+    is_connected.recv().unwrap();
+    release
+}
+
+#[test]
+fn a_server_without_free_connections_is_waited_for_until_the_acquire_timeout() {
+    let role = format!("busy_{}", token());
+    let bookkeeping = format!("sqlx_testdb_busy_{}", token());
+    let database = common::block_on(async {
+        let mut admin = common::admin().await;
+        let database: String =
+            sqlx::query_scalar("SELECT current_database()").fetch_one(&mut admin).await.unwrap();
+        common::execute(
+            &mut admin,
+            &format!(
+                r#"CREATE ROLE "{role}" LOGIN PASSWORD 'pw' CONNECTION LIMIT {LIMITED} CREATEDB;
+                   GRANT CREATE ON DATABASE "{database}" TO "{role}";"#
+            ),
+        )
+        .await;
+        database
+    });
+    let url = server_url_with(|url| {
+        url.set_username(&role).unwrap();
+        url.set_password(Some("pw")).unwrap();
+    });
+    let with_acquire_timeout = |acquire_timeout| Config {
+        bookkeeping_schema: bookkeeping.clone(),
+        pool: PoolSettings { acquire_timeout, ..PoolSettings::DEFAULT },
+        ..config(&url)
+    };
+
+    let release = hold_connections(&url, LIMITED);
+    let impatient = with_acquire_timeout(Duration::from_secs(1));
+    let (message, elapsed) = failure(&impatient, "probe::busy");
+    assert_eq!(first_line(&message), "probe::busy: connecting to the test server");
+    assert!(elapsed >= Duration::from_millis(900) && elapsed < WELL_UNDER_ACQUIRE_TIMEOUT);
+
+    let patient = with_acquire_timeout(Duration::from_secs(20));
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        release.send(()).unwrap();
+    });
+    let started = Instant::now();
+    run_with(&patient, "probe::busy_then_free", &[], |_: PgPool| async {});
+    assert!(started.elapsed() >= Duration::from_millis(500));
+
+    common::block_on(async {
+        let mut admin = common::admin().await;
+        common::drop_all(&mut admin, &patient.prefix).await;
+        common::execute(
+            &mut admin,
+            &format!(
+                r#"DROP SCHEMA IF EXISTS "{bookkeeping}" CASCADE;
+                   DROP OWNED BY "{role}";
+                   DROP ROLE "{role}";"#
+            ),
+        )
+        .await;
+    });
 }
 
 #[test]

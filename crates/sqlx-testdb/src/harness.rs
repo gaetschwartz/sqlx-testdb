@@ -9,7 +9,7 @@ use sqlx::pool::PoolOptions;
 use sqlx::{Connection, Pool};
 
 use crate::args::{TestArgs, TestOutcome};
-use crate::backend::{Backend, ConnectOptionsOf, DropMode, LockKey, LockPurpose};
+use crate::backend::{Backend, ConnectOptionsOf, DropMode, LockKey, LockPurpose, Registration};
 use crate::config::{Config, PoolSettings, Schema};
 use crate::error::{
     ApplyFixtureSnafu, BookkeepingSnafu, ConnectOptionsSnafu, ConnectSnafu, Error,
@@ -19,7 +19,6 @@ use crate::name::{self, Names};
 use crate::schema::LoadedSchema;
 use crate::{probe, sweep, template};
 
-const MASTER_POOL_MAX_CONNECTIONS: u32 = 1;
 const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
 
 pub struct Ctx<'a> {
@@ -130,7 +129,7 @@ pub struct TestDb<DB: Backend> {
     bookkeeping_schema: String,
     keep_failed: bool,
     pool_settings: PoolSettings,
-    master: Pool<DB>,
+    master: DB::Connection,
     options: ConnectOptionsOf<DB>,
     pool: Pool<DB>,
 }
@@ -162,7 +161,13 @@ impl<DB: Backend> TestDb<DB> {
                 .validate(DB::MAX_IDENTIFIER_BYTES)?;
         let url = config.database_url()?;
         let server = DB::parse_options(&url).context(ConnectOptionsSnafu)?;
-        probe::ensure_reachable::<DB>(&url, &server, config.pool.connect_timeout).await?;
+        let mut conn = probe::connect::<DB>(
+            &url,
+            &server,
+            config.pool.connect_timeout,
+            config.pool.acquire_timeout,
+        )
+        .await?;
         let schema = LoadedSchema::load(&config.schema).await?;
         let mut fixture_sql = Vec::with_capacity(fixtures.len());
         for path in fixtures {
@@ -178,40 +183,36 @@ impl<DB: Backend> TestDb<DB> {
             ),
             sweep_key: LockKey::new(LockPurpose::Sweep, &[names.bookkeeping_schema]),
         };
-        let master = PoolOptions::<DB>::new()
-            .max_connections(MASTER_POOL_MAX_CONNECTIONS)
-            .acquire_timeout(config.pool.acquire_timeout)
-            .after_release(|_, _| Box::pin(async { Ok(false) }))
-            .connect_lazy_with(server.clone());
-        let mut conn = master.acquire().await.context(ConnectSnafu)?;
         let bootstrap_key = LockKey::new(LockPurpose::Bootstrap, &[names.bookkeeping_schema]);
         DB::bootstrap(&mut conn, names.bookkeeping_schema, bootstrap_key)
             .await
             .context(BookkeepingSnafu)?;
         let run = name::current_run_key(config.project_root.as_str());
-        let first_of_run = DB::register_run(
+        let name = names.database(test_path, &run);
+        let registration = Registration {
+            run: &run,
+            project_root: config.project_root.as_str(),
+            name: &name,
+            test_path,
+        };
+        let first_of_run = DB::register_test(
             &mut conn,
             names.bookkeeping_schema,
-            &run,
-            config.project_root.as_str(),
+            &registration,
+            config.sweep.run_refresh_after(),
         )
         .await
         .context(BookkeepingSnafu)?;
         if first_of_run {
             sweep::sweep::<DB>(&mut conn, &ctx).await?;
+            template::touch_existing::<DB>(&mut conn, &ctx).await?;
         }
-        template::ensure::<DB>(&mut conn, &ctx, &schema, &server).await?;
-        let name = names.database(test_path, &run);
-        DB::register_database(&mut conn, names.bookkeeping_schema, &name, test_path, &run)
-            .await
-            .context(BookkeepingSnafu)?;
         if let Err(e) = template::clone_into::<DB>(&mut conn, &ctx, &schema, &server, &name).await {
             DB::forget_database(&mut conn, names.bookkeeping_schema, &name)
                 .await
                 .context(BookkeepingSnafu)?;
             return Err(e);
         }
-        drop(conn);
         let options = DB::options_for_database(&server, &name);
         let pool = pool_options(config.pool).connect_lazy_with(options.clone());
         let db = Self {
@@ -220,7 +221,7 @@ impl<DB: Backend> TestDb<DB> {
             bookkeeping_schema: config.bookkeeping_schema.clone(),
             keep_failed: config.keep_failed,
             pool_settings: config.pool,
-            master,
+            master: conn,
             options,
             pool,
         };
@@ -243,17 +244,21 @@ impl<DB: Backend> TestDb<DB> {
         conn.close().await.context(ConnectSnafu)
     }
 
-    async fn drop_database(&self) -> Result<(), Error> {
+    async fn drop_database(mut self) -> Result<(), Error> {
         self.pool.close().await;
-        let mut conn = self.master.acquire().await.context(ConnectSnafu)?;
-        template::drop::<DB>(&mut conn, &self.name, DropMode::Force).await?;
-        DB::forget_database(&mut conn, &self.bookkeeping_schema, &self.name)
-            .await
-            .context(BookkeepingSnafu)
+        let dropped = template::drop::<DB>(&mut self.master, &self.name, DropMode::Force).await;
+        let forgotten = match dropped {
+            Ok(_) => DB::forget_database(&mut self.master, &self.bookkeeping_schema, &self.name)
+                .await
+                .context(BookkeepingSnafu),
+            Err(e) => Err(e),
+        };
+        let _ = self.master.close().await;
+        forgotten
     }
 
-    async fn finish(&self, verdict: Verdict) {
-        let (test_path, name) = (self.test_path.as_str(), self.name.as_str());
+    async fn finish(mut self, verdict: Verdict) {
+        let (test_path, name) = (self.test_path.clone(), self.name.clone());
         if verdict == Verdict::Discard || !self.keep_failed {
             if let Err(e) = self.drop_database().await {
                 eprintln!("{test_path}: could not drop {name}: {}", Report::from_error(e));
@@ -261,10 +266,8 @@ impl<DB: Backend> TestDb<DB> {
             return;
         }
         self.pool.close().await;
-        let marked = match self.master.acquire().await {
-            Ok(mut conn) => DB::mark_failed(&mut conn, &self.bookkeeping_schema, name).await,
-            Err(e) => Err(e),
-        };
+        let marked = DB::mark_failed(&mut self.master, &self.bookkeeping_schema, &name).await;
+        let _ = self.master.close().await;
         match marked {
             Ok(()) => eprintln!("{test_path}: kept its test database {name}"),
             Err(e) => eprintln!(

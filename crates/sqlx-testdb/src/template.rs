@@ -27,16 +27,14 @@ pub async fn drop<DB: Backend>(
     }
 }
 
-pub async fn ensure<DB: Backend>(
+pub async fn touch_existing<DB: Backend>(
     conn: &mut DB::Connection,
     ctx: &Ctx<'_>,
-    schema: &LoadedSchema,
-    options: &ConnectOptionsOf<DB>,
 ) -> Result<(), Error> {
     if DB::database_exists(conn, &ctx.template).await.context(BookkeepingSnafu)? {
-        return touch::<DB>(conn, ctx).await;
+        touch::<DB>(conn, ctx).await?;
     }
-    build::<DB>(conn, ctx, schema, options).await
+    Ok(())
 }
 
 pub async fn clone_into<DB: Backend>(
@@ -71,7 +69,8 @@ pub async fn drop_orphaned_builds<DB: Backend>(
 }
 
 async fn touch<DB: Backend>(conn: &mut DB::Connection, ctx: &Ctx<'_>) -> Result<(), Error> {
-    DB::touch_template(conn, ctx.names.bookkeeping_schema, &ctx.template)
+    let refresh_after = ctx.config.sweep.template_refresh_after();
+    DB::touch_template(conn, ctx.names.bookkeeping_schema, &ctx.template, refresh_after)
         .await
         .context(BookkeepingSnafu)
 }
